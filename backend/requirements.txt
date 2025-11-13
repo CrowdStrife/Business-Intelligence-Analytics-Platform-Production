@@ -16,4 +16,4 @@ python-jose[cryptography]
 requests
 psycopg[binary]
 scipy
-matplotlib
+openpyxl

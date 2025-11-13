@@ -9,12 +9,24 @@ const keycloak = new Keycloak({
 export const initKeycloak = (onAuthenticated: () => void) => {
   keycloak
     .init({
-      onLoad: 'login-required',   
+      onLoad: 'check-sso',   
       checkLoginIframe: false,    
       pkceMethod: 'S256',
+      redirectUri: window.location.origin + '/',
     })
-    .then((ok) => (ok ? onAuthenticated() : keycloak.login()))
-    .catch(() => keycloak.login());
+    .then((authenticated) => {
+      if (authenticated) {
+        onAuthenticated();
+      } else {
+        keycloak.login({
+          redirectUri: window.location.origin + '/',
+        });
+      }
+    })
+    .catch((error) => {
+      console.error('Keycloak init failed:', error);
+      // Don't auto-retry on error to prevent infinite loop
+    });
 };
 
 export const doLogin = keycloak.login;
