@@ -1,0 +1,69 @@
+# ETL output folders
+arima_results/
+cleaned_data/
+descriptive_results/
+etl_dimensions/
+holtwinters_results/
+mba_drinks/
+mba_foods/
+mba_meal/
+mba_results/
+mba_output/
+raw_costing/
+raw_sales/
+raw_sales_by_product/
+regression_results/
+ped_output/
+sarima_results/
+
+# Pipeline trigger files
+backend/trigger/complete
+trigger/
+
+
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+.env.example/
+env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls
+
+# Environmental variable
+.env
+
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build outputs
+dist/
+build/
+
+# TypeScript
+*.tsbuildinfo

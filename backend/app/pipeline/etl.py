@@ -1,0 +1,1360 @@
+import os
+import re
+import time
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+from typing import List
+
+from . import loader
+
+from app.core.config import settings
+from minio import Minio
+import io
+import psycopg2
+
+# =========================
+# STAGING / COPY HELPERS (for buffer-based load)
+# =========================
+
+def _get_minio_client_for_etl():
+    return Minio(
+        settings.minio_endpoint,
+        access_key=settings.minio_access,
+        secret_key=settings.minio_secret,
+        secure=settings.minio_secure,
+    )
+
+def _ensure_staging_bucket_for_etl():
+    client = _get_minio_client_for_etl()
+    bucket = settings.minio_staging_bucket
+    found = client.bucket_exists(bucket)
+    if not found:
+        client.make_bucket(bucket)
+
+def _staging_put_bytes_etl(object_name: str, data: bytes, content_type: str = "text/csv") -> int:
+    _ensure_staging_bucket_for_etl()
+    client = _get_minio_client_for_etl()
+    bio = io.BytesIO(data)
+    client.put_object(
+        bucket_name=settings.minio_staging_bucket,
+        object_name=object_name,
+        data=bio,
+        length=len(data),
+        content_type=content_type,
+    )
+    return len(data)
+
+def _staging_get_bytes_etl(object_name: str) -> bytes:
+    client = _get_minio_client_for_etl()
+    resp = client.get_object(settings.minio_staging_bucket, object_name)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+        resp.release_conn()
+
+def _staging_delete_prefix_etl(prefix: str) -> None:
+    client = _get_minio_client_for_etl()
+    if prefix and not prefix.endswith('/'):
+        prefix = prefix + '/'
+    for obj in client.list_objects(settings.minio_staging_bucket, prefix=prefix, recursive=True):
+        client.remove_object(settings.minio_staging_bucket, obj.object_name)
+
+def _clear_landing_bucket_etl() -> None:
+    """
+    Delete all files from landing bucket after successful ETL.
+    Removes raw_sales_by_transaction, raw_sales_by_product, and _complete marker.
+    """
+    client = _get_minio_client_for_etl()
+    bucket = settings.minio_landing_bucket
+    
+    print("Cleaning up landing bucket...")
+    deleted_count = 0
+    for obj in client.list_objects(bucket, recursive=True):
+        client.remove_object(bucket, obj.object_name)
+        deleted_count += 1
+    
+    print(f"Deleted {deleted_count} objects from landing bucket: {bucket}")
+
+def _pg_connect_for_etl():
+    return psycopg2.connect(
+        host=settings.db_host,
+        port=settings.db_port,
+        dbname=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+    )
+
+def _upsert_via_temp_table(csv_bytes: bytes, table_name: str, columns: List[str], key_columns: List[str]) -> None:
+    """
+    Load CSV to temp table via COPY, then UPSERT into final table.
+    """
+    temp_table = f"temp_{table_name}_{int(time.time() * 1000)}"
+    collist = ", ".join(f'"{c}"' for c in columns)
+    
+    with _pg_connect_for_etl() as conn:
+        with conn.cursor() as cur:
+            # Create temp table with same structure
+            cur.execute(f"CREATE TEMP TABLE {temp_table} (LIKE {table_name} INCLUDING DEFAULTS)")
+            
+            # COPY into temp table
+            copy_sql = f"COPY {temp_table} ({collist}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE)"
+            cur.copy_expert(copy_sql, io.StringIO(csv_bytes.decode('utf-8')))
+            
+            # UPSERT from temp to final
+            if key_columns:
+                conflict_cols = ", ".join(f'"{c}"' for c in key_columns)
+                update_cols = [c for c in columns if c not in key_columns]
+                
+                if update_cols:
+                    set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+                    upsert_sql = f"""
+                        INSERT INTO {table_name} ({collist})
+                        SELECT {collist} FROM {temp_table}
+                        ON CONFLICT ({conflict_cols})
+                        DO UPDATE SET {set_clause}
+                    """
+                else:
+                    upsert_sql = f"""
+                        INSERT INTO {table_name} ({collist})
+                        SELECT {collist} FROM {temp_table}
+                        ON CONFLICT ({conflict_cols})
+                        DO NOTHING
+                    """
+                cur.execute(upsert_sql)
+            else:
+                # No key columns = plain insert
+                insert_sql = f"INSERT INTO {table_name} ({collist}) SELECT {collist} FROM {temp_table}"
+                cur.execute(insert_sql)
+            
+            # Drop temp table
+            cur.execute(f"DROP TABLE {temp_table}")
+        conn.commit()
+
+def _bulk_upsert_from_staging_etl(prefix: str, plan: List[dict]) -> None:
+    """
+    Load CSVs from staging, UPSERT into PostgreSQL via temp tables.
+    Each plan entry must have: table, filename, columns, key_columns
+    """
+    if prefix and not prefix.endswith('/'):
+        prefix = prefix + '/'
+    for step in plan:
+        obj_name = prefix + step['filename']
+        csv_bytes = _staging_get_bytes_etl(obj_name)
+        _upsert_via_temp_table(
+            csv_bytes,
+            step['table'],
+            step['columns'],
+            step.get('key_columns', [])
+        )
+
+# =========================
+# NAMING HELPERS (for final outputs only)
+# =========================
+
+def to_snake_case(name: str) -> str:
+    if not isinstance(name, str):
+        return name
+    name = name.strip()
+    if not name:
+        return name
+    name = re.sub(r"[^0-9a-zA-Z]+", "_", name)
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    name = re.sub(r"_+", "_", name)
+    return name.strip("_").lower()
+
+def rename_columns_snake_case(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return df
+    return df.rename(columns={c: to_snake_case(c) for c in df.columns})
+
+# =========================
+# INPUT PARSING (legacy behavior)
+# =========================
+
+def process_sales_file(file_obj):
+    """Process individual sales file to handle varying structures (legacy logic)."""
+    df = pd.read_excel(file_obj)
+
+    header_row = None
+    for i in range(min(10, len(df))):
+        row_values = df.iloc[i].astype(str).str.lower()
+        if any(col in row_values.values for col in ["date", "receipt", "time"]):
+            header_row = i
+            break
+
+    if header_row is None:
+        header_row = 4
+
+    df.columns = df.iloc[header_row]
+    df = df[header_row + 1:].reset_index(drop=True)
+    df = df.loc[:, ~df.columns.isna()]
+    return df
+
+def process_product_file(file_obj):
+    """Process individual product file to handle varying structures (legacy logic)."""
+    df = pd.read_excel(file_obj)
+
+    header_row = None
+    for i in range(min(10, len(df))):
+        row_values = df.iloc[i].astype(str).str.lower()
+        if any(col in row_values.values for col in ["date", "receipt", "product", "item"]):
+            header_row = i
+            break
+
+    if header_row is None:
+        header_row = 4
+
+    df.columns = df.iloc[header_row]
+    df = df[header_row + 1:].reset_index(drop=True)
+    df = df.loc[:, ~df.columns.isna()]
+    return df
+
+# =========================
+# TIME DIMENSION
+# =========================
+
+def create_time_dimension(_date_series):
+    """
+    Create a time dimension with hours (H01-H23) and minutes (H01M00-H23M59).
+    Ignores input; kept for legacy compatibility.
+    """
+    hour_rows = []
+    for h in range(0, 24):
+        hour_rows.append({
+            "time_id": f"H{h:02}",
+            "time_desc": f"{h:02}",
+            "time_level": 1,
+            "parent_id": "NA",
+        })
+
+    minute_rows = []
+    for h in range(0, 24):
+        for m in range(0, 60):
+            minute_rows.append({
+                "time_id": f"H{h:02}M{m:02}",
+                "time_desc": f"{h:02}:{m:02}",
+                "time_level": 0,
+                "parent_id": f"H{h:02}",
+            })
+
+    return pd.DataFrame(hour_rows + minute_rows)
+
+# =========================
+# COSTING (legacy heuristic)
+# =========================
+
+@lru_cache(maxsize=None)
+def normalize_drink_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    name = name.replace("CAR ", "CARAMEL ")
+    return (
+        name.upper()
+        .replace(" ", "")
+        .replace("OZ", "")
+        .replace("CHOCO", "CHOCOLATE")
+    )
+
+@lru_cache(maxsize=None)
+def get_drink_cost(product_name: str) -> float | None:
+    """
+    Same odd logic:
+    - Uses first file from raw_costing/*.xlsx
+    - Picks sheet via fuzzy score
+    - Reads numeric from row 35
+    """
+    import glob
+
+    try:
+        costing_files = glob.glob("raw_costing/*.xlsx")
+        if not costing_files:
+            return None
+
+        xl = pd.ExcelFile(costing_files[0])
+        product_norm = normalize_drink_name(product_name)
+
+        best_match = None
+        best_score = 0
+
+        for sheet in xl.sheet_names:
+            sheet_norm = normalize_drink_name(sheet)
+            score = 0
+
+            # Note: product_norm has no spaces; kept for parity with legacy.
+            for word in product_norm.split():
+                if len(word) >= 4 and word in sheet_norm:
+                    score += 2
+
+            for size in ["8", "12", "16"]:
+                if size in product_norm and size in sheet_norm:
+                    score += 1
+                    break
+
+            if "HOT" in product_norm and "HOT" in sheet_norm:
+                score += 1
+            elif ("ICED" in product_norm or "COLD" in product_norm) and "ICED" in sheet_norm:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_match = sheet
+
+        if best_match and best_score >= 2:
+            df = pd.read_excel(costing_files[0], sheet_name=best_match, header=None)
+            if len(df) > 35:
+                row_35 = df.iloc[35]
+                for col in range(1, len(row_35)):
+                    if pd.notna(row_35[col]) and isinstance(row_35[col], (int, float)):
+                        return round(float(row_35[col]), 2)
+    except Exception:
+        pass
+
+    return None
+
+# =========================
+# PRODUCT HELPERS (same logic as legacy, made reusable)
+# =========================
+
+drink_keywords = {
+    "ICED", "ICE", "HOT", "8OZ", "12OZ", "16OZ", "COLD",
+    "TEA", "LATTE", "SHAKE", "FRAPPE", "MOCHA", "GLASS", "PITCHER", "WATER"
+}
+token_pattern = re.compile(r"[A-Z0-9]+")
+others_triggers = ["CHARGING"]
+others_word_regex = re.compile(r"\bTAKE\b")
+extra_phrase_triggers = ["BOTTLED WATER", "PLAIN RICE"]
+extra_word_triggers = [
+    re.compile(r"\bEGG\b"),
+    re.compile(r"\bDIJON\b"),
+    re.compile(r"\bEXTRA\b"),
+]
+
+def compute_parent_sku(name: str) -> str:
+    if not isinstance(name, str) or name.strip() == "":
+        return ""
+    original = name.upper().strip()
+    work = original.replace(".", " ")
+    work = re.sub(r"\b(8|12|16)0Z\b", lambda m: m.group(1) + "OZ", work)
+    size_pattern = re.compile(r"\b(8|12|16)\s*(?:O|0)Z\.?(?=\b)")
+    triggers = {"ICED", "ICE", "HOT", "COLD"}
+
+    has_trigger = any(t in work.split() for t in triggers) or bool(size_pattern.search(work))
+    if has_trigger:
+        work = size_pattern.sub("", work)
+        tokens = [
+            tok for tok in work.split()
+            if tok not in triggers and tok not in {"OZ"}
+        ]
+        tokens = [tok for tok in tokens if tok not in {"8", "12", "16"}]
+        if not tokens:
+            tokens = original.split()
+    else:
+        tokens = original.split()
+
+    while tokens and tokens[-1] in {"1", "2", "3"}:
+        tokens.pop()
+    return "-".join(tokens)
+
+def infer_category(product_name: str, product_id: str) -> str:
+    if not isinstance(product_name, str):
+        product_name = ""
+    upper_name = product_name.upper()
+
+    if any(trig in upper_name for trig in others_triggers) or others_word_regex.search(upper_name):
+        return "OTHERS"
+
+    if any(phrase in upper_name for phrase in extra_phrase_triggers) or any(
+        rgx.search(upper_name) for rgx in extra_word_triggers
+    ):
+        return "EXTRA"
+
+    tokens = {t.upper() for t in token_pattern.findall(upper_name)}
+    category = "DRINK" if tokens & drink_keywords else "FOOD"
+
+    if isinstance(product_id, str):
+        upid = product_id.upper()
+        if "DRNKS" in upid or "DKS" in upid:
+            category = "DRINK"
+
+    return category
+
+def calculate_product_cost(product_name: str, category: str, price):
+    if category == "DRINK":
+        cost = get_drink_cost(product_name)
+        if cost:
+            return cost
+    return round(price * 0.60, 2) if pd.notna(price) else np.nan
+
+# =========================
+# EXTRACT (MinIO landing)
+# =========================
+
+def extract():
+    print("=== EXTRACT PHASE ===")
+
+    # Sales Transactions from MinIO
+    print("Extracting Excel Sales Transactions List from MinIO landing/raw_sales_by_transaction ...")
+    sales_files_meta = loader.get_sales_files_from_minio()
+    sales_dfs = [process_sales_file(m["fileobj"]) for m in sales_files_meta] if sales_files_meta else []
+
+    print("\nChecking for date range overlaps in sales files...")
+    file_date_ranges = []
+    for m, df in zip(sales_files_meta, sales_dfs):
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            valid = df["Date"].dropna()
+            if not valid.empty:
+                file_date_ranges.append({
+                    "file": os.path.basename(m["object_name"]),
+                    "min_date": valid.min(),
+                    "max_date": valid.max(),
+                })
+                print(
+                    f"  {os.path.basename(m['object_name'])}: "
+                    f"{valid.min():%Y-%m-%d} to {valid.max():%Y-%m-%d}"
+                )
+
+    for i in range(len(file_date_ranges)):
+        for j in range(i + 1, len(file_date_ranges)):
+            r1, r2 = file_date_ranges[i], file_date_ranges[j]
+            if r1["min_date"] <= r2["max_date"] and r2["min_date"] <= r1["max_date"]:
+                overlap_start = max(r1["min_date"], r2["min_date"])
+                overlap_end = min(r1["max_date"], r2["max_date"])
+                print("\nWARNING: Overlap detected!")
+                print(f"  Files: '{r1['file']}' and '{r2['file']}'")
+                print(
+                    f"  Overlap period: {overlap_start:%Y-%m-%d} to {overlap_end:%Y-%m-%d}"
+                )
+    print()
+
+    all_cols = set()
+    for df in sales_dfs:
+        all_cols.update(df.columns)
+    for i, df in enumerate(sales_dfs):
+        for c in all_cols:
+            if c not in df.columns:
+                df[c] = None
+        sales_dfs[i] = df[sorted(all_cols)]
+    sales_df = pd.concat(sales_dfs, ignore_index=True) if sales_dfs else pd.DataFrame()
+
+    if "Date" in sales_df.columns:
+        sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce", dayfirst=False)
+
+    # Sales by Product from MinIO
+    print(
+        "Extracting Excel Sales Report by Product List from MinIO landing/raw_sales_by_product ..."
+    )
+    prod_files_meta = loader.get_sales_by_product_files_from_minio()
+    prod_dfs = [process_product_file(m["fileobj"]) for m in prod_files_meta] if prod_files_meta else []
+
+    print("\nChecking for date range overlaps in sales by product files...")
+    prod_ranges = []
+    for m, df in zip(prod_files_meta, prod_dfs):
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=False)
+            valid = df["Date"].dropna()
+            if not valid.empty:
+                prod_ranges.append({
+                    "file": os.path.basename(m["object_name"]),
+                    "min_date": valid.min(),
+                    "max_date": valid.max(),
+                })
+                print(
+                    f"  {os.path.basename(m['object_name'])}: "
+                    f"{valid.min():%Y-%m-%d} to {valid.max():%Y-%m-%d}"
+                )
+
+    for i in range(len(prod_ranges)):
+        for j in range(i + 1, len(prod_ranges)):
+            r1, r2 = prod_ranges[i], prod_ranges[j]
+            if r1["min_date"] <= r2["max_date"] and r2["min_date"] <= r1["max_date"]:
+                overlap_start = max(r1["min_date"], r2["min_date"])
+                overlap_end = min(r1["max_date"], r2["max_date"])
+                print("\nWARNING: Overlap detected!")
+                print(f"  Files: '{r1['file']}' and '{r2['file']}'")
+                print(
+                    f"  Overlap period: {overlap_start:%Y-%m-%d} to {overlap_end:%Y-%m-%d}"
+                )
+    print()
+
+    all_prod_cols = set()
+    for df in prod_dfs:
+        all_prod_cols.update(df.columns)
+    for i, df in enumerate(prod_dfs):
+        for c in all_prod_cols:
+            if c not in df.columns:
+                df[c] = None
+        prod_dfs[i] = df[sorted(all_prod_cols)]
+    sales_by_product_df = pd.concat(prod_dfs, ignore_index=True) if prod_dfs else pd.DataFrame()
+
+    if "Date" in sales_by_product_df.columns:
+        sales_by_product_df["Date"] = pd.to_datetime(sales_by_product_df["Date"], errors="coerce", dayfirst=False)
+    if "Date" in sales_df.columns:
+        sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce", dayfirst=False)
+
+    if "Take Out" in sales_by_product_df.columns:
+        sales_by_product_df["Take Out"] = sales_by_product_df["Take Out"].apply(
+            lambda x: "True"
+            if str(x).strip().upper() == "Y"
+            else ("False" if pd.isna(x) or str(x).strip() == "" else x)
+        )
+
+    print("Extract phase completed successfully.")
+    return sales_df, sales_by_product_df
+
+# =========================
+# TRANSFORM (legacy logic, no CSV writes)
+# =========================
+
+def transform(sales_df, sales_by_product_df):
+    print("=== TRANSFORM PHASE ===")
+    print("Cleaning Data...")
+
+    # Sales cleaning
+    cols_drop_sales = [
+        "Posted", "Price Level", "Branch", "TM#", "Customer ID", "Customer Name",
+        "Cashier", "Serviced By", "Dine In", "Take Out", "Local Tax", "Amusement Tax",
+        "EWT", "NAC", "Solo Parent", "Service", "Feedback Rating", "Diplomat"
+    ]
+    sales_df = sales_df.drop(
+        columns=[c for c in cols_drop_sales if c in sales_df.columns],
+        errors="ignore",
+    )
+
+    if "Date" in sales_df.columns:
+        sales_df = sales_df[
+            sales_df["Date"].notna()
+            & (sales_df["Date"].astype(str).str.strip() != "")
+        ].reset_index(drop=True)
+
+    if "Time" in sales_df.columns:
+        sales_df = sales_df[
+            sales_df["Time"].notna()
+            & (sales_df["Time"].astype(str).str.strip() != "")
+        ].reset_index(drop=True)
+
+    # Sales by Product cleaning
+    cols_drop_prod = [
+        "Lot/Serial", "Posted", "TM#", "Unit", "Discount ID", "Discount",
+        "% Discount", "Price ID", "Branch", "Customer ID", "Customer"
+    ]
+    sales_by_product_df = sales_by_product_df.drop(
+        columns=[c for c in cols_drop_prod if c in sales_by_product_df.columns],
+        errors="ignore",
+    )
+
+    if "Date" in sales_by_product_df.columns:
+        sales_by_product_df = sales_by_product_df[
+            sales_by_product_df["Date"].notna()
+            & (sales_by_product_df["Date"].astype(str).str.strip() != "")
+        ].reset_index(drop=True)
+
+    if "Time" in sales_by_product_df.columns:
+        sales_by_product_df = sales_by_product_df[
+            sales_by_product_df["Time"].notna()
+            & (sales_by_product_df["Time"].astype(str).str.strip() != "")
+        ].reset_index(drop=True)
+
+        # Outlier filter for Price inside this block (legacy behavior)
+        if "Price" in sales_by_product_df.columns:
+            sales_by_product_df = sales_by_product_df[
+                pd.to_numeric(sales_by_product_df["Price"], errors="coerce").between(0, 50000)
+            ].reset_index(drop=True)
+
+        for col in ["Qty", "Line Total", "Net Total", "Price"]:
+            if col in sales_by_product_df.columns:
+                sales_by_product_df = sales_by_product_df[
+                    pd.to_numeric(sales_by_product_df[col], errors="coerce") >= 0
+                ].reset_index(drop=True)
+
+    # Create DateTime columns by combining Date and Time
+    if "Date" in sales_df.columns and "Time" in sales_df.columns:
+        sales_df["DateTime"] = pd.to_datetime(
+            sales_df["Date"].astype(str) + " " + sales_df["Time"].astype(str),
+            errors="coerce"
+        )
+    
+    if "Date" in sales_by_product_df.columns and "Time" in sales_by_product_df.columns:
+        sales_by_product_df["DateTime"] = pd.to_datetime(
+            sales_by_product_df["Date"].astype(str) + " " + sales_by_product_df["Time"].astype(str),
+            errors="coerce"
+        )
+
+    # Standardization rules (copied as-is from legacy)
+    if "Product ID" in sales_by_product_df.columns and "Product Name" in sales_by_product_df.columns:
+        standardization_rules = [
+            {
+                "from_ids": ["FDS-2017-0024-W-DCS-BLMW"],
+                "from_names": ["DOUBLE CHOCOLATE AND STRAWBERRIES"],
+                "to_id": "2024waffles4",
+                "to_name": "DOUBLE CHOCS AND STRAWBERRIES",
+            },
+            {
+                "from_ids": ["FDS-2017-0020-W-BN2-BLMW"],
+                "from_names": ["BANANA NUTELLA WAFFLES"],
+                "to_id": "2024waffles2",
+                "to_name": "BANANA NUTELLA",
+            },
+            {
+                "from_ids": ["FDS-2017-0028-S-BCT-BLMW"],
+                "from_names": ["BACON, COLESLAW AND TOMATO"],
+                "to_id": "2024Breads7",
+                "to_name": "CLASSIC BACON COLESLAW N TOMATO",
+            },
+            {
+                "from_ids": ["FDS-2017-0029-S-TCS-BLMW"],
+                "from_names": ["THE CLUB SANDWICH"],
+                "to_id": "2024breads",
+                "to_name": "THE CKUB",
+            },
+            {
+                "from_ids": ["DKS-2018-0034-COOL-PEACH-16-BLMW"],
+                "from_names": ["PEACH"],
+                "to_id": "DKS-2018-0025-SH-CAMPCH-16-BLMW",
+                "to_name": "CAMOMILE PEACH",
+            },
+            {
+                "from_ids": ["DKS-2017-0025-SH-16-BLMW"],
+                "from_names": ["CHAMOMILE PEACH"],
+                "to_id": "DKS-2018-0020-FRAPPE-PCHLUCK-16-BLMW",
+                "to_name": "PEACHIEST LUCK",
+            },
+            {
+                "from_ids": ["FDS-2018-0001-GARLICBRD--BLMW"],
+                "from_names": ["GARLIC BREAD EXTRA"],
+                "to_id": "2024BREads9",
+                "to_name": "GALIC BREAD ALA CARTE",
+            },
+            {
+                "from_ids": ["FDS-2018-0001-BEF-KOR-BLMW"],
+                "from_names": ["KOREAN BEEF BBQ"],
+                "to_id": "2024lrgplates13",
+                "to_name": "K POP BBQ BEEF",
+            },
+            {
+                "from_ids": ["2024FDPIZSCREAM"],
+                "from_names": ["SPINACH & CREAM PIZZA"],
+                "to_id": "2024pizza3",
+                "to_name": "SPINACH N CREAM PIZZA",
+            },
+            {
+                "from_ids": ["2024PromobundleChix steak"],
+                "from_names": ["CHICKEN STEAK PROMO BUNDLE"],
+                "to_id": "2024PromoChixsteak",
+                "to_name": "CHICKEN STEAK PROMO",
+            },
+            {
+                "from_ids": ["FDS-2017-0030-PBB-LONG-BLMW"],
+                "from_names": ["LONGANISA PBB"],
+                "to_id": "2024FilBfast4",
+                "to_name": "FIL BFAST LONGGANISA",
+            },
+            {
+                "from_ids": ["FDS-2018-0001-MOJOS-BLMW"],
+                "from_names": ["MOJOS"],
+                "to_id": "2024smlplates2",
+                "to_name": "MOJOJOJOS",
+            },
+            {
+                "from_ids": ["FFDS-2020-VM-DANGGIT-BLMW", "FDS-2017-0030-PBB-DNGGT-BLMW"],
+                "from_names": ["DANGGIT", "DANGGIT PBB"],
+                "to_id": "2024FilBFast3",
+                "to_name": "FIL BREAKFAST DANGGIT",
+            },
+            {
+                "from_ids": ["FDSS-2018-001-EGG-EXT-BLMW"],
+                "from_names": ["EXTRA EGG"],
+                "to_id": "ING-EGG",
+                "to_name": "EGG",
+            },
+            {
+                "from_ids": [
+                    "FDS-2017-009-SPAMFRT-BLMW",
+                    "FDS-2017-009-SPAMRI-BLMW",
+                    "FDS-2017-009-SPAMRI-BLMW",
+                ],
+                "from_names": [
+                    "SPAM, FRENCH TOAST, EGGS AND HASH BROWN",
+                    "SPAM, RICE, EGGS, HASH BROWN",
+                    "SPAM, WAFFLES, EGGS, HASH BROWN",
+                ],
+                "to_id": "FDS-2017-0010-ADB-S-BLMW",
+                "to_name": "SPAM WITH RICE OR WAFFLES OR FRENCH TOAST",
+            },
+            {
+                "from_ids": [
+                    "FDS-2017-009-HUNGFRT-BLMW",
+                    "FDS-2017-009-HUNGRI-BLMW",
+                    "FDS-2017-009-HUNGRI-BLMW",
+                ],
+                "from_names": [
+                    "HUNGARIAN SAUSAGE, FRENCH TOAST, EGGS AND HASH BROWN",
+                    "HUNGARIAN SAUSAGE, RICE, EGGS, HASH BROWN",
+                    "HUNGARIAN SAUSAGE, WAFFLES, EGGS AND HASH BROWN",
+                ],
+                "to_id": "FDS-2017-0011-ADB-HS-BLMW",
+                "to_name": "HUNGARIAN SAUSAGE WITH RICE OR WAFFLES OR FRENCH TOAST",
+            },
+            {
+                "from_ids": [
+                    "FDS-2017-009-GERFRT-BLMW",
+                    "FDS-2017-009-GERRI-BLMW",
+                    "FDS-2017-009-GERWAF-BLMW",
+                ],
+                "from_names": [
+                    "GERMAN FRANKS, FRENCH TOAST, EGGS AND HASH BROWN",
+                    "GERMAN FRANKS, RICE, EGGS AND HASH BROWN",
+                    "GERMAN FRANKS, WAFFLES, EGGS AND HASH BROWN",
+                ],
+                "to_id": "FDS-2017-0012-ADB-GF-BLMW",
+                "to_name": "GERMAN FRANKS WITH RICE OR WAFFLES OR FRENCH TOAST",
+            },
+            {
+                "from_ids": [
+                    "FDS-2017-009-CBFRT-BLMW",
+                    "FDS-2017-009-CBRI-BLMW",
+                    "FDS-2017-009-CBWAF-BLMW",
+                ],
+                "from_names": [
+                    "CORNED BEEF, FRENCH TOAST, EGGS AND HASH BROWN",
+                    "CORNED BEEF, RICE, EGGS, AND HASH BROWN",
+                    "CORNED BEEF, WAFFLES, EGGS, HASH BROWN",
+                ],
+                "to_id": "FDS-2017-0013-ADB-CB-BLMW",
+                "to_name": "CORNED BEEF WITH RICE OR WAFFLES OR FRENCH TOAST",
+            },
+            {
+                "from_ids": [
+                    "FDS-2017-009-BAFRT-BLMW",
+                    "FDS-2017-009-BARI-BLMW",
+                    "FDS-2017-009-BAWA-BLMW",
+                ],
+                "from_names": [
+                    "BACON, FRENCH TOAST, EGGS, HASH BROWN",
+                    "BACON, RICE, EGGS AND HASH BROWN",
+                    "BACON, WAFFLES, EGGS, HASH BROWN",
+                ],
+                "to_id": "FDS-2017-009-ADB-B-BLMW",
+                "to_name": "BACON WITH RICE OR WAFFLES OR FRENCH TOAST",
+            },
+        ]
+
+        for rule in standardization_rules:
+            rule["from_names_upper"] = {
+                n.strip().upper() for n in rule.get("from_names", [])
+            }
+
+        for rule in standardization_rules:
+            mask_id = sales_by_product_df["Product ID"].astype(str).isin(
+                rule.get("from_ids", [])
+            )
+            mask_name = sales_by_product_df["Product Name"].astype(str).str.strip().str.upper().isin(
+                rule.get("from_names_upper", set())
+            )
+            mask = mask_id | mask_name
+            if mask.any():
+                sales_by_product_df.loc[mask, "Product ID"] = rule["to_id"]
+                sales_by_product_df.loc[mask, "Product Name"] = rule["to_name"]
+
+    # Normalize Product IDs by first-seen Product Name
+    if "Product ID" in sales_by_product_df.columns and "Product Name" in sales_by_product_df.columns:
+        tmp = sales_by_product_df[
+            ["Product Name", "Product ID"]
+        ].dropna(subset=["Product Name", "Product ID"]).copy()
+        tmp["__norm_name"] = (
+            tmp["Product Name"].astype(str).str.strip().str.casefold()
+        )
+        name_to_first_id = (
+            tmp.drop_duplicates(subset="__norm_name")
+            .set_index("__norm_name")["Product ID"]
+        )
+        norm_names = (
+            sales_by_product_df["Product Name"]
+            .astype(str)
+            .str.strip()
+            .str.casefold()
+        )
+        sales_by_product_df["Product ID"] = norm_names.map(
+            name_to_first_id
+        ).fillna(sales_by_product_df["Product ID"])
+        del tmp
+
+    if "Product Name" in sales_by_product_df.columns:
+        sales_by_product_df["Product Name"] = (
+            sales_by_product_df["Product Name"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+    if "Receipt#" in sales_df.columns:
+        sales_df = sales_df.rename(columns={"Receipt#": "Receipt No"})
+
+    # De-dupe sales_df
+    print("Checking Sales Transactions for duplicates...")
+    before_sales = len(sales_df)
+    if all(c in sales_df.columns for c in ["Date", "Receipt No", "Time"]):
+        sales_df = sales_df.drop_duplicates(
+            subset=["Date", "Receipt No", "Time"], keep="first"
+        ).reset_index(drop=True)
+        removed = before_sales - len(sales_df)
+        if removed > 0:
+            print(
+                f"Removed {removed} duplicate sales records "
+                f"({removed / before_sales * 100:.2f}%)"
+            )
+        else:
+            print(f"No duplicates found - all {before_sales} records are unique")
+    else:
+        print("Skipping: Required columns not found")
+
+    # Merge sales & by-product
+    print("Merging Sales Transaction and Sales by Product List")
+    if "Receipt No" in sales_df.columns and "Receipt No" in sales_by_product_df.columns:
+        combined_df = pd.merge(
+            sales_df,
+            sales_by_product_df,
+            on="Receipt No",
+            suffixes=("", "_product"),
+            how="inner",
+        )
+        if "Date_product" in combined_df.columns:
+            combined_df = combined_df.drop(columns=["Date_product"])
+    else:
+        print("Warning: Receipt No column not found in one or both dataframes")
+        combined_df = pd.DataFrame()
+
+    print("Transform phase completed successfully.")
+    return combined_df
+
+# =========================
+# PRODUCT DIMENSIONS - FULL BUILD
+# =========================
+
+def create_product_dimensions_full(combined_df: pd.DataFrame):
+    """
+    Original behavior:
+    - Build full current_product_dimension from all data.
+    - Build history_product_dimension with one row per distinct (product_id, product_name, Price).
+    - Mark latest record_version as is_current.
+    Used when there is no existing history_product_dimension.
+    """
+    if "Product ID" not in combined_df.columns or "Product Name" not in combined_df.columns:
+        print("Warning: Required product columns (Product ID, Product Name) not found")
+        return None, None
+
+    df = combined_df.copy()
+    df = df.rename(columns={"Product ID": "product_id", "Product Name": "product_name"})
+
+    product_columns = ["product_id", "product_name", "Price"]
+    available_product_columns = [c for c in product_columns if c in df.columns]
+    if "DateTime" in df.columns:
+        available_product_columns.append("DateTime")
+    elif "Date" in df.columns:
+        available_product_columns.append("Date")
+
+    # Current: latest row per product_id
+    current_products = df.groupby("product_id").last().reset_index()
+    current_product_dim = current_products[available_product_columns].copy()
+
+    current_product_dim["record_version"] = 1
+    current_product_dim["is_current"] = True
+
+    if "DateTime" in current_product_dim.columns:
+        current_product_dim = current_product_dim.rename(
+            columns={"DateTime": "last_transaction_datetime"}
+        )
+    elif "Date" in current_product_dim.columns:
+        current_product_dim = current_product_dim.rename(
+            columns={"Date": "last_transaction_datetime"}
+        )
+
+    # parent_sku + CATEGORY + product_cost
+    if "product_name" in current_product_dim.columns:
+        current_product_dim["parent_sku"] = current_product_dim["product_name"].apply(
+            compute_parent_sku
+        )
+        current_product_dim["CATEGORY"] = current_product_dim.apply(
+            lambda r: infer_category(r.get("product_name", ""), r.get("product_id", "")),
+            axis=1,
+        )
+
+    def _calc_cost_row(row):
+        return calculate_product_cost(
+            row.get("product_name", ""),
+            row.get("CATEGORY"),
+            row.get("Price"),
+        )
+
+    current_product_dim["product_cost"] = current_product_dim.apply(_calc_cost_row, axis=1)
+
+    if "Price" in current_product_dim.columns and "product_cost" in current_product_dim.columns:
+        cols = list(current_product_dim.columns)
+        cols.remove("product_cost")
+        insert_pos = cols.index("Price") + 1
+        cols.insert(insert_pos, "product_cost")
+        current_product_dim = current_product_dim[cols]
+
+    # History: unique states
+    history_product_dim = df[available_product_columns].copy()
+    if "Price" in available_product_columns:
+        history_product_dim = history_product_dim.drop_duplicates(
+            subset=["product_id", "product_name", "Price"]
+        )
+    else:
+        history_product_dim = history_product_dim.drop_duplicates(
+            subset=["product_id", "product_name"]
+        )
+
+    history_product_dim["record_version"] = (
+        history_product_dim.groupby("product_id").cumcount() + 1
+    )
+    history_product_dim["is_current"] = False
+
+    latest_versions = history_product_dim.groupby("product_id")["record_version"].max()
+    for product_id, max_version in latest_versions.items():
+        mask = (
+            (history_product_dim["product_id"] == product_id)
+            & (history_product_dim["record_version"] == max_version)
+        )
+        history_product_dim.loc[mask, "is_current"] = True
+
+    if "product_name" in history_product_dim.columns:
+        history_product_dim["parent_sku"] = history_product_dim["product_name"].apply(
+            compute_parent_sku
+        )
+        history_product_dim["CATEGORY"] = history_product_dim.apply(
+            lambda r: infer_category(r.get("product_name", ""), r.get("product_id", "")),
+            axis=1,
+        )
+
+    history_product_dim["product_cost"] = history_product_dim.apply(
+        _calc_cost_row, axis=1
+    )
+
+    if "Price" in history_product_dim.columns and "product_cost" in history_product_dim.columns:
+        cols = list(history_product_dim.columns)
+        cols.remove("product_cost")
+        insert_pos = cols.index("Price") + 1
+        cols.insert(insert_pos, "product_cost")
+        history_product_dim = history_product_dim[cols]
+
+    if "DateTime" in history_product_dim.columns:
+        history_product_dim = history_product_dim.rename(
+            columns={"DateTime": "last_transaction_datetime"}
+        )
+    elif "Date" in history_product_dim.columns:
+        history_product_dim = history_product_dim.rename(
+            columns={"Date": "last_transaction_datetime"}
+        )
+
+    return current_product_dim, history_product_dim
+
+# =========================
+# PRODUCT DIMENSIONS - INCREMENTAL
+# =========================
+
+def create_product_dimensions_incremental(combined_df: pd.DataFrame):
+    """
+    Incremental SCD behavior for Scenario 1:
+    - combined_df contains ONLY NEW data since last run.
+    - history_product_dimension already has prior versions.
+    - We:
+        * keep old versions;
+        * add new version when price changes;
+        * update is_current flags.
+    """
+    required = ["Product ID", "Product Name", "Price"]
+    if not all(c in combined_df.columns for c in required):
+        print("Warning: Missing product columns for incremental build.")
+        return None, None
+
+    df = combined_df.copy()
+    df = df.rename(columns={"Product ID": "product_id", "Product Name": "product_name"})
+
+    if "DateTime" in combined_df.columns:
+        df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
+    elif "Date" in df.columns:
+        df["DateTime"] = pd.to_datetime(df["Date"], errors="coerce")
+    else:
+        df["DateTime"] = pd.NaT
+
+    df = df.dropna(subset=["product_id", "Price"])
+
+    if df.empty:
+        return None, None
+
+    # Latest state per product in THIS batch
+    batch_latest = (
+        df.sort_values("DateTime")
+          .groupby("product_id", as_index=False)
+          .last()
+    )
+
+    product_ids = batch_latest["product_id"].astype(str).unique().tolist()
+    existing_hist = loader.fetch_history_for_products(product_ids)
+
+    history_rows = []
+    current_rows = []
+
+    for _, row in batch_latest.iterrows():
+        pid = str(row["product_id"])
+        pname = str(row["product_name"])
+        new_price = float(row["Price"])
+        new_datetime = row["DateTime"] if not pd.isna(row["DateTime"]) else None
+
+        existing_pid = existing_hist[existing_hist["product_id"] == pid]
+
+        # CASE 1: brand new product (no history)
+        if existing_pid.empty:
+            new_rv = 1
+            category = infer_category(pname, pid)
+            parent_sku = compute_parent_sku(pname)
+            prod_cost = calculate_product_cost(pname, category, new_price)
+
+            history_rows.append({
+                "product_id": pid,
+                "product_name": pname,
+                "price": new_price,
+                "record_version": new_rv,
+                "is_current": True,
+                "last_transaction_datetime": new_datetime,
+                "parent_sku": parent_sku,
+                "CATEGORY": category,
+                "product_cost": prod_cost,
+            })
+
+            current_rows.append({
+                "product_id": pid,
+                "product_name": pname,
+                "price": new_price,
+                "record_version": new_rv,
+                "is_current": True,
+                "last_transaction_datetime": new_datetime,
+                "parent_sku": parent_sku,
+                "CATEGORY": category,
+                "product_cost": prod_cost,
+            })
+            continue
+
+        # CASE 2: existing product (has history)
+        cur = existing_pid[existing_pid["is_current"] == True]
+        if cur.empty:
+            cur = existing_pid.loc[[existing_pid["record_version"].idxmax()]]
+        cur = cur.iloc[0]
+
+        old_price = float(cur["price"])
+        old_rv = int(cur["record_version"])
+        old_datetime = cur.get("last_transaction_datetime")
+        old_parent_sku = cur.get("parent_sku")
+        old_category = cur.get("category") or cur.get("CATEGORY")
+        old_cost = cur.get("product_cost")
+
+        # Price unchanged -> possibly update last_transaction_date
+        if new_price == old_price:
+            updated_hist = {
+                "product_id": cur["product_id"],
+                "product_name": cur["product_name"],
+                "price": old_price,
+                "record_version": old_rv,
+                "is_current": True,
+                "last_transaction_datetime": old_datetime,
+                "parent_sku": old_parent_sku,
+                "CATEGORY": old_category,
+                "product_cost": old_cost,
+            }
+
+            if new_datetime and (not old_datetime or pd.isna(old_datetime) or new_datetime > old_datetime):
+                updated_hist["last_transaction_datetime"] = new_datetime
+
+            history_rows.append(updated_hist)
+
+            current_rows.append({
+                "product_id": pid,
+                "product_name": pname,
+                "price": old_price,
+                "record_version": old_rv,
+                "is_current": True,
+                "last_transaction_datetime": updated_hist["last_transaction_datetime"],
+                "parent_sku": old_parent_sku,
+                "CATEGORY": old_category,
+                "product_cost": old_cost,
+            })
+            continue
+
+        # Price changed -> create new version
+        max_rv = int(existing_pid["record_version"].max())
+        new_rv = max_rv + 1
+
+        # Make sure old current is flagged non-current
+        old_cur = {
+            "product_id": cur["product_id"],
+            "product_name": cur["product_name"],
+            "price": old_price,
+            "record_version": old_rv,
+            "is_current": False,
+            "last_transaction_datetime": old_datetime,
+            "parent_sku": old_parent_sku,
+            "CATEGORY": old_category,
+            "product_cost": old_cost,
+        }
+        history_rows.append(old_cur)
+
+        # New current version
+        category = infer_category(pname, pid)
+        parent_sku = compute_parent_sku(pname)
+        prod_cost = calculate_product_cost(pname, category, new_price)
+
+        new_hist = {
+            "product_id": pid,
+            "product_name": pname,
+            "price": new_price,
+            "record_version": new_rv,
+            "is_current": True,
+            "last_transaction_datetime": new_datetime,
+            "parent_sku": parent_sku,
+            "CATEGORY": category,
+            "product_cost": prod_cost,
+        }
+        history_rows.append(new_hist)
+
+        current_rows.append({
+            "product_id": pid,
+            "product_name": pname,
+            "price": new_price,
+            "record_version": new_rv,
+            "is_current": True,
+            "last_transaction_datetime": new_datetime,
+            "parent_sku": parent_sku,
+            "CATEGORY": category,
+            "product_cost": prod_cost,
+        })
+
+    history_product_dim = pd.DataFrame(history_rows) if history_rows else None
+    current_product_dim = pd.DataFrame(current_rows) if current_rows else None
+
+    return current_product_dim, history_product_dim
+
+# =========================
+# LOAD via BUFFER (MinIO staging → PostgreSQL COPY → UPSERT)
+# =========================
+
+def _df_dates_to_iso_etl(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.date.astype(str)
+    return df
+
+def _df_timestamps_to_iso_etl(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Convert timestamp columns to ISO format string."""
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime('%Y-%m-%d %H:%M:%S')
+    return df
+
+def load(combined_df: pd.DataFrame):
+    print("=== LOAD PHASE (buffer → COPY → UPSERT) ===")
+
+    if combined_df is None or combined_df.empty:
+        print("Warning: Combined dataframe is empty, no database writes performed")
+        print("Load phase completed.")
+        return
+
+    # ---------- 1) Build time_dimension ----------
+    time_dim_df = create_time_dimension(combined_df["Date"]) if "Date" in combined_df.columns else pd.DataFrame()
+    time_dim_snake = rename_columns_snake_case(time_dim_df)
+
+    # ---------- 2) Build product dimensions (BOTH current AND history) ----------
+    if loader.has_history_product_dimension():
+        current_product_dim, history_product_dim = create_product_dimensions_incremental(combined_df)
+    else:
+        current_product_dim, history_product_dim = create_product_dimensions_full(combined_df)
+
+    current_snake = rename_columns_snake_case(current_product_dim) if current_product_dim is not None else pd.DataFrame()
+    current_snake = _df_timestamps_to_iso_etl(current_snake, ["last_transaction_datetime"])
+
+    history_snake = rename_columns_snake_case(history_product_dim) if history_product_dim is not None else pd.DataFrame()
+    history_snake = _df_timestamps_to_iso_etl(history_snake, ["last_transaction_datetime"])
+
+    # ---------- 3) Prepare fact + transaction_records ----------
+    def time_to_id(time_str):
+        try:
+            s = str(time_str).strip()
+            if ":" in s:
+                h, m = s.split(":", 1)
+            elif len(s) == 4 and s.isdigit():
+                h, m = s[:2], s[2:]
+            else:
+                return None
+            return f"H{int(h):02}M{int(m):02}"
+        except Exception:
+            return None
+
+    if "Time" in combined_df.columns:
+        combined_df["time_id"] = combined_df["Time"].apply(time_to_id)
+    else:
+        combined_df["time_id"] = None
+
+    priority_columns = [
+        "Date", "time_id", "Receipt No", "Product ID", "Product Name",
+        "Qty", "Price", "Line Total", "Net Total",
+    ]
+    existing_priority = [c for c in priority_columns if c in combined_df.columns]
+    remaining = [c for c in combined_df.columns if c not in existing_priority and c not in ["Time", "DateTime"]]
+    final_cols = existing_priority + remaining
+
+    if "Time" in combined_df.columns:
+        combined_df = combined_df.drop(columns=["Time"])
+
+    combined_df = combined_df[final_cols]
+    combined_df = combined_df.drop_duplicates().reset_index(drop=True)
+
+    # fact_transaction_dimension: exclude latest month
+    if "Date" in combined_df.columns:
+        combined_df["Date"] = pd.to_datetime(combined_df["Date"], errors="coerce", dayfirst=False)
+        latest_month = combined_df["Date"].dt.to_period("M").max()
+        fact_df = combined_df[combined_df["Date"].dt.to_period("M") != latest_month].reset_index(drop=True)
+    else:
+        fact_df = combined_df.copy()
+
+    # transaction_records: map Product ID → parent_sku
+    parent_map = {}
+    if not current_snake.empty and "product_id" in current_snake.columns and "parent_sku" in current_snake.columns:
+        parent_map = dict(zip(current_snake["product_id"].astype(str), current_snake["parent_sku"].astype(str)))
+
+    txn_df = pd.DataFrame()
+    if "Receipt No" in combined_df.columns and "Product ID" in combined_df.columns:
+        tmp = combined_df.copy()
+        tmp["Product ID"] = tmp["Product ID"].astype(str)
+        tmp["__parent_sku"] = tmp["Product ID"].map(parent_map).fillna(tmp["Product ID"])
+        txn_df = (
+            tmp.groupby("Receipt No")["__parent_sku"].apply(lambda x: ",".join(x.astype(str))).reset_index(name="SKU")
+        )
+
+    # snake_case + ISO dates
+    fact_snake = rename_columns_snake_case(fact_df)
+    fact_snake = _df_dates_to_iso_etl(fact_snake, ["date"])
+    txn_snake = rename_columns_snake_case(txn_df)
+
+    # ---------- 4) BUFFER: write CSVs to MinIO staging/etl/<run_id>/ ----------
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"{settings.minio_etl_folder}/{run_id}/"
+
+    def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8")
+
+    # Deduplicate all DataFrames based on their primary keys
+    if not time_dim_snake.empty:
+        time_dim_snake = time_dim_snake.drop_duplicates(subset=["time_id"], keep="last")
+    if not current_snake.empty:
+        current_snake = current_snake.drop_duplicates(subset=["product_id"], keep="last")
+    if not history_snake.empty:
+        history_snake = history_snake.drop_duplicates(subset=["product_id", "record_version"], keep="last")
+    if not txn_snake.empty:
+        txn_snake = txn_snake.drop_duplicates(subset=["receipt_no"], keep="last")
+    if not fact_snake.empty:
+        fact_snake = fact_snake.drop_duplicates(subset=["receipt_no", "date", "product_id"], keep="last")
+
+    artifacts = []
+
+    if not time_dim_snake.empty:
+        time_cols = list(time_dim_snake.columns)
+        _staging_put_bytes_etl(run_prefix + "time_dimension.csv", _to_csv_bytes(time_dim_snake))
+        artifacts.append({
+            "table": "time_dimension",
+            "filename": "time_dimension.csv",
+            "columns": time_cols,
+            "key_columns": ["time_id"]
+        })
+
+    if not current_snake.empty:
+        prod_cols = list(current_snake.columns)
+        _staging_put_bytes_etl(run_prefix + "current_product_dimension.csv", _to_csv_bytes(current_snake))
+        artifacts.append({
+            "table": "current_product_dimension",
+            "filename": "current_product_dimension.csv",
+            "columns": prod_cols,
+            "key_columns": ["product_id"]
+        })
+
+    if not history_snake.empty:
+        hist_cols = list(history_snake.columns)
+        _staging_put_bytes_etl(run_prefix + "history_product_dimension.csv", _to_csv_bytes(history_snake))
+        artifacts.append({
+            "table": "history_product_dimension",
+            "filename": "history_product_dimension.csv",
+            "columns": hist_cols,
+            "key_columns": ["product_id", "record_version"]
+        })
+
+    if not txn_snake.empty:
+        txn_cols = list(txn_snake.columns)
+        _staging_put_bytes_etl(run_prefix + "transaction_records.csv", _to_csv_bytes(txn_snake))
+        artifacts.append({
+            "table": "transaction_records",
+            "filename": "transaction_records.csv",
+            "columns": txn_cols,
+            "key_columns": ["receipt_no"]
+        })
+
+    if not fact_snake.empty:
+        fact_cols = list(fact_snake.columns)
+        _staging_put_bytes_etl(run_prefix + "fact_transaction_dimension.csv", _to_csv_bytes(fact_snake))
+        artifacts.append({
+            "table": "fact_transaction_dimension",
+            "filename": "fact_transaction_dimension.csv",
+            "columns": fact_cols,
+            "key_columns": ["receipt_no", "date", "product_id"]
+        })
+
+    # Load in strict sequence with UPSERT
+    order = ["time_dimension", "current_product_dimension", "history_product_dimension", "transaction_records", "fact_transaction_dimension"]
+    plan = [a for name in order for a in artifacts if a["table"] == name]
+
+    try:
+        _bulk_upsert_from_staging_etl(run_prefix, plan)
+        print("Bulk UPSERT complete. Cleaning buffer …")
+        _staging_delete_prefix_etl(run_prefix)
+        print("Buffer cleared:", run_prefix)
+    except Exception as e:
+        print(f"Bulk load failed. Buffer retained at {run_prefix} for inspection. Error: {e}")
+        raise
+
+    print("Load phase completed successfully.")
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    print("Starting ETL Pipeline (MinIO -> legacy rules -> BUFFER -> UPSERT to PostgreSQL)…")
+    total_start = time.time()
+    try:
+        t0 = time.time()
+        sales_df, sales_by_product_df = extract()
+        print(f"Extract phase took: {time.time() - t0:.2f} seconds.\n")
+
+        t1 = time.time()
+        combined_df = transform(sales_df, sales_by_product_df)
+        print(f"Transform phase took: {time.time() - t1:.2f} seconds.\n")
+
+        t2 = time.time()
+        load(combined_df)
+        print(f"Load phase took: {time.time() - t2:.2f} seconds.\n")
+
+        # Clean up landing bucket after successful ETL
+        _clear_landing_bucket_etl()
+        
+        print("ETL Process Complete.")
+    except Exception as e:
+        print(f"ETL Pipeline failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print(f"Total execution time: {time.time() - total_start:.2f} seconds.")
+
+if __name__ == "__main__":
+    main()
