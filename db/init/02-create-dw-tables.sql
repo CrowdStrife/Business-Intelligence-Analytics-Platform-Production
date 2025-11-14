@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS fact_transaction_dimension (
     senior NUMERIC(12,2),
     tax NUMERIC(12,2),
     total_gross NUMERIC(12,2),
-    void INTEGER,
+    void BOOLEAN,
     base_qty INTEGER,
     take_out VARCHAR(10),
     PRIMARY KEY (receipt_no, date, product_id),
