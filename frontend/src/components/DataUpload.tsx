@@ -44,6 +44,49 @@ export const DataUpload: React.FC = () => {
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false);
   const [filePendingRemoval, setFilePendingRemoval] = useState<{ file: FileWithPreview; category: FileCategory } | null>(null);
   const [categoryToClear, setCategoryToClear] = useState<FileCategory | 'all' | null>(null);
+  
+  // System status polling
+  const [isSystemProcessing, setIsSystemProcessing] = useState(false);
+  const [processingMessage, setProcessingMessage] = useState('');
+  const [processingDuration, setProcessingDuration] = useState(0);
+
+  // Poll system status every 5 seconds
+  React.useEffect(() => {
+    const checkSystemStatus = async () => {
+      try {
+        const response = await fetch(`${API_ENDPOINTS.upload}/status`);
+        const data = await response.json();
+        
+        setIsSystemProcessing(data.is_processing || false);
+        setProcessingMessage(data.message || '');
+      } catch (error) {
+        console.error('Failed to check system status:', error);
+        // Don't block UI if status check fails
+        setIsSystemProcessing(false);
+      }
+    };
+
+    // Check immediately on mount
+    checkSystemStatus();
+
+    // Then poll every 5 seconds
+    const interval = setInterval(checkSystemStatus, 5000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Track processing duration
+  React.useEffect(() => {
+    if (isSystemProcessing) {
+      setProcessingDuration(0);
+      const timer = setInterval(() => {
+        setProcessingDuration(prev => prev + 1);
+      }, 1000);
+      return () => clearInterval(timer);
+    } else {
+      setProcessingDuration(0);
+    }
+  }, [isSystemProcessing]);
 
   const cleanFileName = useCallback((name: string) => {
     const dot = name.lastIndexOf('.');
@@ -403,13 +446,30 @@ export const DataUpload: React.FC = () => {
   const allFiles = [...rawSalesFiles, ...salesByProductFiles];
   const totalSizeFormatted = formatBytes(allFiles.reduce((sum, f) => sum + f.size, 0));
   
-  // Validation: Both categories must have at least one file
+  // Validation: Both categories must have at least one file AND system must not be processing
   const hasRawSalesFiles = rawSalesFiles.length > 0;
   const hasSalesByProductFiles = salesByProductFiles.length > 0;
-  const canUpload = hasRawSalesFiles && hasSalesByProductFiles;
+  const canUpload = hasRawSalesFiles && hasSalesByProductFiles && !isSystemProcessing;
 
   return (
     <div className={styles.dataUploadContainer}>
+      {/* Processing Overlay */}
+      {isSystemProcessing && (
+        <div className={styles.processingOverlay}>
+          <div className={styles.processingModal}>
+            <div className={styles.spinner}></div>
+            <h2>Processing Data...</h2>
+            <p>{processingMessage}</p>
+            <p className={styles.processingTime}>
+              Processing time: {Math.floor(processingDuration / 60)}m {processingDuration % 60}s
+            </p>
+            <p className={styles.processingNote}>
+              Please wait. The system will be available for new uploads once processing completes.
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className={styles.dataUploadHeader}>
         <h1>Data Upload</h1>
         <p>Upload your data files for analysis. Supported formats: CSV, Excel (.xls, .xlsx)</p>

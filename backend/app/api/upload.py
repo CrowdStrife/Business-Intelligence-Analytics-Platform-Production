@@ -15,8 +15,9 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from typing import List
 
 # from app.services.auth import get_current_user
-from app.services.storage import upload_file_to_minio, create_complete_marker
+from app.services.storage import upload_file_to_minio, create_complete_marker, check_processing_status
 from app.core.config import settings
+from minio import Minio
 
 # Create an APIRouter
 router = APIRouter()
@@ -37,6 +38,29 @@ def validate_file_type(filename: str) -> bool:
     return ext.lower() in ALLOWED_EXTENSIONS
 
 
+@router.get("/status")
+async def check_upload_status():
+    """
+    Check if the system is ready for uploads by checking for processing markers in MinIO.
+    Returns status indicating if processing is in progress.
+    """
+    try:
+        is_processing, message = check_processing_status()
+        
+        return {
+            "is_processing": is_processing,
+            "message": message,
+            "status": "processing" if is_processing else "ready"
+        }
+    except Exception as e:
+        log.error(f"Error checking upload status: {e}")
+        return {
+            "is_processing": False,
+            "message": "Unable to determine system status",
+            "status": "unknown"
+        }
+
+
 @router.post("/")
 async def handle_file_upload(
     files: List[UploadFile] = File(...),
@@ -49,6 +73,19 @@ async def handle_file_upload(
     files, uploads them to MinIO, and triggers the processing pipeline.
     """
     ##log.info(f"Upload request received from user: {current_user.get('email')}")
+
+    # --- Check if processing is already in progress ---
+    is_processing, message = check_processing_status()
+    if is_processing:
+        log.warning("Upload rejected: Processing already in progress")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Upload or processing already in progress.",
+                "action": "Please wait for the current processing to complete (typically 2-5 minutes) and try again.",
+                "status": "processing"
+            }
+        )
 
     uploaded_files_details = []
 

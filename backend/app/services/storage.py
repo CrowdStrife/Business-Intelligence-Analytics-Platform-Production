@@ -115,3 +115,41 @@ async def create_complete_marker():
         log.error(f"Unexpected error creating marker: {e}")
         raise
 
+
+def check_processing_status():
+    """
+    Checks if processing is currently in progress by looking for marker files
+    in the landing bucket.
+    
+    Returns:
+        tuple: (is_processing: bool, message: str)
+    """
+    try:
+        # Ensure bucket exists
+        ensure_bucket_exists(settings.minio_landing_bucket)
+        
+        # Check for any marker files (starting with underscore)
+        markers = list(minio_client.list_objects(
+            settings.minio_landing_bucket,
+            prefix="_",
+            recursive=False
+        ))
+        
+        if not markers:
+            return False, "System ready for upload"
+        
+        # Check which marker exists
+        marker_names = [obj.object_name for obj in markers]
+        
+        if "_complete" in marker_names:
+            return True, "Files are being processed. This typically takes 2-5 minutes."
+        
+        # Any other marker also means processing
+        return True, "Processing in progress"
+        
+    except S3Error as e:
+        log.error(f"MinIO S3Error checking status: {e}")
+        return False, "Unable to check system status"
+    except Exception as e:
+        log.error(f"Unexpected error checking status: {e}")
+        return False, "Unable to check system status"
